@@ -56,7 +56,16 @@ impl Module for TinyLlama {
             &self.config,
             input.device(),
         )?;
-        self.model.forward(input, seq_len as usize, &mut cache)
+
+        let output = self.model.forward(input, seq_len as usize, &mut cache)?;
+        
+        // Assert output dimensions
+        assert_eq!(output.shape().dims().len(), 3, "Output tensor should be 3-dimensional");
+        assert_eq!(output.shape().dims()[1], seq_len, "Output sequence length should match input");
+        assert_eq!(output.shape().dims()[2], VOCAB_SIZE, "Output last dimension should match vocab size");
+        
+        Ok(output)
+
     }
 }
 
@@ -94,15 +103,26 @@ pub fn load_dataset(device: &Device) -> Result<(Tensor, Tensor)> {
     println!("Dataset loaded in {:?}", duration);
     println!("Total tokens: {}", all_input_ids.len());
 
-    let input_ids_tensor = Tensor::from_slice(&all_input_ids, (all_input_ids.len() / BATCH_SIZE, BATCH_SIZE), device)?;
-    let labels_tensor = Tensor::from_slice(&all_labels, (all_labels.len() / BATCH_SIZE, BATCH_SIZE), device)?;        
+    let seq_len = 128; // Choose an appropriate sequence length
+    let num_batches = all_input_ids.len() / (BATCH_SIZE * seq_len);
+    
+    let input_ids_tensor = Tensor::from_slice(&all_input_ids[..(num_batches * BATCH_SIZE * seq_len)], (num_batches, BATCH_SIZE, seq_len), device)?;
+    let labels_tensor = Tensor::from_slice(&all_labels[..(num_batches * BATCH_SIZE * seq_len)], (num_batches, BATCH_SIZE, seq_len), device)?;        
+
+    // Assert dataset tensor dimensions
+    assert_eq!(input_ids_tensor.shape().dims(), labels_tensor.shape().dims(), "Input and label tensors should have the same dimensions");
+    assert_eq!(input_ids_tensor.shape().dims().len(), 3, "Dataset tensors should be 3-dimensional");
 
     Ok((input_ids_tensor, labels_tensor))
 }
 
 fn train(model: &mut TinyLlama, varmap: &mut VarMap, device: &Device) -> Result<()> {
     let (input_ids, labels) = load_dataset(&device)?;
-    
+
+    // Assert input and label dimensions
+    assert_eq!(input_ids.shape().dims(), labels.shape().dims(), "Input and label tensors should have the same dimensions");
+
+
     let mut opt = candle_nn::AdamW::new_lr(
         varmap.all_vars(),
         LEARNING_RATE
@@ -123,9 +143,22 @@ fn train(model: &mut TinyLlama, varmap: &mut VarMap, device: &Device) -> Result<
             let batch_input = input_ids.narrow(0, batch_idx, 1)?.squeeze(0)?;
             let batch_labels = labels.narrow(0, batch_idx, 1)?.squeeze(0)?;
 
+            // Assert batch input and label dimensions
+            assert_eq!(batch_input.shape().dims(), batch_labels.shape().dims(), "Batch input and label tensors should have the same dimensions");
+            assert_eq!(batch_input.shape().dims().len(), 2, "Batch tensors should be 2-dimensional");
+
             println!("Debug: batch_input shape: {:?}", batch_input.shape());
             let logits = model.forward(&batch_input)?;
+
+            // Assert logits dimensions
+            assert_eq!(logits.shape().dims().len(), 3, "Logits tensor should be 3-dimensional");
+            assert_eq!(logits.shape().dims()[0], BATCH_SIZE, "Logits first dimension should match batch size");
+            assert_eq!(logits.shape().dims()[2], VOCAB_SIZE, "Logits last dimension should match vocab size");
+
             let loss = candle_nn::loss::cross_entropy(&logits.transpose(1, 2)?, &batch_labels)?;
+
+            // Assert loss dimension
+            assert_eq!(loss.shape().dims().len(), 0, "Loss should be a scalar (0-dimensional tensor)");
 
             opt.backward_step(&loss)?;
 
@@ -147,6 +180,7 @@ fn train(model: &mut TinyLlama, varmap: &mut VarMap, device: &Device) -> Result<
 
     Ok(())
 }
+
 
 fn main() -> Result<()> {
     let device = Device::cuda_if_available(0)?;
