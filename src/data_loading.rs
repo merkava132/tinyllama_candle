@@ -40,6 +40,14 @@ pub fn process_chunks(chunks: &[String], tokenizer: &Tokenizer) -> Result<Vec<i6
 }
 
 pub fn load_and_process_file(file_path: &Path, tokenizer: &Tokenizer, chunk_size: usize) -> Result<Vec<i64>> {
-    let chunks = load_chunks(file_path, chunk_size)?;
-    process_chunks(&chunks, tokenizer)
+    // Use shard 0 for the test split, similar to llama2.c
+    // https://github.com/karpathy/llama2.c/blob/ce05cc28cf1e3560b873bb21837638a434520a67/tinystories.py#L121
+    let path = std::path::PathBuf::from(pretokenized_dir).join("data00.bin");
+    let bytes = std::fs::read(path)?;
+    // Tokens are encoded as u16.
+    let mut tokens = vec![0u16; bytes.len() / 2];
+    std::io::Cursor::new(bytes).read_u16_into::<LittleEndian>(&mut tokens)?;
+    tokens.into_iter().map(|u| u as u32).collect::<Vec<u32>>()
+
 }
+
