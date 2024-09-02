@@ -1,4 +1,5 @@
-use candle_core::{Device, DType, Tensor, Result};
+use candle_core::{Device, DType, Result};
+use candle_core::Tensor;
 use candle_nn::Optimizer;
 use candle_nn::{VarBuilder, Module, VarMap};
 use candle_transformers::models::llama::{Llama, Config, Cache};
@@ -7,6 +8,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use tokenizers::Tokenizer;
+use std::time::Instant;
 
 const HIDDEN_SIZE: usize = 64;
 const INTERMEDIATE_SIZE: usize = 256;
@@ -46,6 +48,7 @@ impl TinyLlama {
 
 impl Module for TinyLlama {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        println!("Debug: Input shape in forward: {:?}", input.shape());
         let (seq_len, batch_size) = input.shape().dims2()?;
         let mut cache = Cache::new(
             false,
@@ -57,13 +60,15 @@ impl Module for TinyLlama {
     }
 }
 
-
 pub fn load_dataset(device: &Device) -> Result<(Tensor, Tensor)> {
-    let dataset_path = Path::new("tinystories_dataset");
+    let dataset_path = Path::new("tinier_stories_dataset");
     let tokenizer = Tokenizer::from_file("tokenizer.json").expect("Failed to load tokenizer");
 
     let mut all_input_ids = Vec::new();
     let mut all_labels = Vec::new();
+
+    println!("Loading dataset...");
+    let start = Instant::now();
 
     for entry in fs::read_dir(dataset_path)? {
         let entry = entry?;
@@ -85,21 +90,29 @@ pub fn load_dataset(device: &Device) -> Result<(Tensor, Tensor)> {
         }
     }
 
-    let input_ids_tensor = Tensor::from_slice(&all_input_ids, (all_input_ids.len(),), device)?;
-    let labels_tensor = Tensor::from_slice(&all_labels, (all_labels.len(),), device)?;
+    let duration = start.elapsed();
+    println!("Dataset loaded in {:?}", duration);
+    println!("Total tokens: {}", all_input_ids.len());
+
+    let input_ids_tensor = Tensor::from_slice(&all_input_ids, (all_input_ids.len() / BATCH_SIZE, BATCH_SIZE), device)?;
+    let labels_tensor = Tensor::from_slice(&all_labels, (all_labels.len() / BATCH_SIZE, BATCH_SIZE), device)?;        
 
     Ok((input_ids_tensor, labels_tensor))
 }
 
-
 fn train(model: &mut TinyLlama, varmap: &mut VarMap, device: &Device) -> Result<()> {
     let (input_ids, labels) = load_dataset(&device)?;
+    
     let mut opt = candle_nn::AdamW::new_lr(
         varmap.all_vars(),
         LEARNING_RATE
     )?;
 
+    let total_start = Instant::now();
+
     for epoch in 0..EPOCHS {
+        println!("Starting epoch {}/{}", epoch + 1, EPOCHS);
+        let epoch_start = Instant::now();
         let mut total_loss = 0f32;
         let num_batches = input_ids.dim(0)? / BATCH_SIZE;
 
@@ -107,19 +120,30 @@ fn train(model: &mut TinyLlama, varmap: &mut VarMap, device: &Device) -> Result<
             let batch_start = batch_idx * BATCH_SIZE;
             let batch_end = (batch_idx + 1) * BATCH_SIZE;
 
-            let batch_input = input_ids.narrow(0, batch_start, BATCH_SIZE)?;
-            let batch_labels = labels.narrow(0, batch_start, BATCH_SIZE)?;
+            let batch_input = input_ids.narrow(0, batch_idx, 1)?.squeeze(0)?;
+            let batch_labels = labels.narrow(0, batch_idx, 1)?.squeeze(0)?;
 
+            println!("Debug: batch_input shape: {:?}", batch_input.shape());
             let logits = model.forward(&batch_input)?;
             let loss = candle_nn::loss::cross_entropy(&logits.transpose(1, 2)?, &batch_labels)?;
 
             opt.backward_step(&loss)?;
 
-            total_loss += loss.to_scalar::<f32>()?;
+            let batch_loss = loss.to_scalar::<f32>()?;
+            total_loss += batch_loss;
+
+            if (batch_idx + 1) % 10 == 0 || batch_idx == num_batches - 1 {
+                println!("  Batch {}/{}: Loss = {:.4}", batch_idx + 1, num_batches, batch_loss);
+            }
         }
 
-        println!("Epoch {}: Average loss = {}", epoch + 1, total_loss / num_batches as f32);
+        let epoch_duration = epoch_start.elapsed();
+        println!("Epoch {}: Average loss = {:.4}, Duration: {:?}", 
+                 epoch + 1, total_loss / num_batches as f32, epoch_duration);
     }
+
+    let total_duration = total_start.elapsed();
+    println!("Total training time: {:?}", total_duration);
 
     Ok(())
 }
